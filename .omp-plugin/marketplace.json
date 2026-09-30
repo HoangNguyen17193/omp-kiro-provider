@@ -1,0 +1,22 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "omp-kiro-provider",
+  "owner": { "name": "tino" },
+  "metadata": {
+    "description": "Kiro model provider for Oh My Pi",
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "omp-kiro-provider",
+      "description": "Kiro device-code login, account-scoped model discovery, and streaming for OMP.",
+      "version": "0.1.0",
+      "source": "./",
+      "license": "MIT",
+      "homepage": "https://github.com/HoangNguyen17193/omp-kiro-provider",
+      "repository": "https://github.com/HoangNguyen17193/omp-kiro-provider",
+      "keywords": ["kiro", "aws", "provider"],
+      "category": "development"
+    }
+  ]
+}
