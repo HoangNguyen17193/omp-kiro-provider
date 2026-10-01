@@ -4,6 +4,7 @@ import { type KiroAuthDeps, loginKiro, refreshKiro } from "./auth";
 import { fetchKiroModels } from "./catalog";
 import { KIRO_API_ID, KIRO_DEFAULT_REGION, runtimeBaseUrl } from "./endpoints";
 import { type KiroStreamDeps, streamKiro } from "./stream";
+import { kiroUsageProvider } from "./usage";
 
 export { KIRO_PROVIDER_ID } from "./endpoints";
 
@@ -16,6 +17,12 @@ export type KiroProviderDeps = KiroStreamDeps & KiroAuthDeps;
  */
 export function kiroProviderConfig(deps: KiroProviderDeps) {
   return {
+    /**
+     * Credits live behind the management API, not the response stream, so
+     * `/usage` and `omp usage` only cover this account through a registered
+     * usage provider. Hosts that predate the additive `usage` field ignore it.
+     */
+    usage: kiroUsageProvider,
     // Per-request hosts follow the profile ARN's region; this is the default region's runtime host.
     baseUrl: runtimeBaseUrl(KIRO_DEFAULT_REGION),
     api: KIRO_API_ID,

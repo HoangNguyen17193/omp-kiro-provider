@@ -1,4 +1,4 @@
-import type { Api, Model } from "@oh-my-pi/pi-ai";
+import type { Api, Model, UsageFetchContext } from "@oh-my-pi/pi-ai";
 import { encodeFrame } from "../src/eventstream";
 import type { FetchLike } from "../src/http";
 
@@ -79,4 +79,13 @@ export function kiroModel(overrides: Partial<Model<Api>> = {}): Model<Api> {
   };
   // Test fixture: the fields a transport reads; catalog identity metadata is irrelevant here.
   return model as unknown as Model<Api>;
+}
+
+/**
+ * Adapt the plugin's string-only fetch double to the host's wider `FetchImpl`
+ * signature. The host only ever passes string URLs, so the cast is the whole
+ * difference between the two types.
+ */
+export function usageContext(fetch: FetchLike): UsageFetchContext {
+  return { fetch: fetch as unknown as UsageFetchContext["fetch"] };
 }

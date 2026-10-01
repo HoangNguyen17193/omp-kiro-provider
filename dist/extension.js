@@ -20621,9 +20621,154 @@ function streamKiro(deps, model, context, options) {
   return stream;
 }
 
+// src/usage.ts
+var USAGE_ORIGIN = "AI_EDITOR";
+var USAGE_RESOURCE_TYPE = "AGENTIC_REQUEST";
+var CountSchema = exports_external.union([exports_external.number(), exports_external.string()]);
+var ResetSchema = exports_external.union([exports_external.number(), exports_external.string()]);
+var BreakdownSchema = exports_external.looseObject({
+  resourceType: exports_external.string().optional(),
+  currentUsage: CountSchema.optional(),
+  usageLimit: CountSchema.optional(),
+  currentUsageWithPrecision: CountSchema.optional(),
+  usageLimitWithPrecision: CountSchema.optional(),
+  nextDateReset: ResetSchema.optional()
+});
+var UsageLimitsSchema = exports_external.looseObject({
+  usageBreakdownList: exports_external.array(BreakdownSchema).default([]),
+  nextDateReset: ResetSchema.optional(),
+  subscriptionInfo: exports_external.looseObject({ subscriptionTitle: exports_external.string().optional() }).optional()
+});
+function toFiniteNumber(value) {
+  if (typeof value === "number")
+    return Number.isFinite(value) ? value : undefined;
+  if (typeof value === "string" && value.trim() !== "") {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : undefined;
+  }
+  return;
+}
+function toResetTimestampMs(value) {
+  const numeric = toFiniteNumber(value);
+  if (numeric !== undefined)
+    return numeric < 1000000000000 ? numeric * 1000 : numeric;
+  if (typeof value !== "string")
+    return;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+async function fetchKiroUsage(fetchImpl, accessToken, region, profileArn, signal) {
+  const arn = profileArn ?? (await resolveProfile(fetchImpl, accessToken, region, { builderId: false, signal })).arn;
+  const apiRegion = regionFromProfileArn(arn) ?? region;
+  const query = new URLSearchParams({
+    origin: USAGE_ORIGIN,
+    resourceType: USAGE_RESOURCE_TYPE,
+    profileArn: arn
+  });
+  const response = await requestJson(fetchImpl, {
+    method: "GET",
+    url: `${managementBaseUrl(apiRegion)}/GetUsageLimits?${query}`,
+    headers: { Authorization: `Bearer ${accessToken}` },
+    signal,
+    label: "Kiro usage lookup"
+  }, UsageLimitsSchema);
+  const credit = response.usageBreakdownList.find((item) => item.resourceType === "CREDIT");
+  if (!credit)
+    throw new Error(`Kiro usage lookup returned no credit breakdown in ${apiRegion}`);
+  const used = toFiniteNumber(credit.currentUsageWithPrecision) ?? toFiniteNumber(credit.currentUsage);
+  const total = toFiniteNumber(credit.usageLimitWithPrecision) ?? toFiniteNumber(credit.usageLimit);
+  if (used === undefined || total === undefined) {
+    throw new Error(`Kiro usage lookup returned an incomplete credit breakdown in ${apiRegion}`);
+  }
+  const resetTimestampMs = toResetTimestampMs(credit.nextDateReset) ?? toResetTimestampMs(response.nextDateReset);
+  const snapshot = {
+    usedCredits: used,
+    totalCredits: total,
+    remainingCredits: Math.max(total - used, 0)
+  };
+  if (resetTimestampMs !== undefined)
+    snapshot.resetTimestampMs = resetTimestampMs;
+  const subscriptionTitle = response.subscriptionInfo?.subscriptionTitle;
+  if (subscriptionTitle)
+    snapshot.subscriptionTitle = subscriptionTitle;
+  return snapshot;
+}
+function usageStatusFor(usedFraction) {
+  if (usedFraction === undefined)
+    return "unknown";
+  if (usedFraction >= 1)
+    return "exhausted";
+  if (usedFraction >= 0.9)
+    return "warning";
+  return "ok";
+}
+function supportsKiroUsage(params) {
+  return params.provider === KIRO_PROVIDER_ID && params.credential.type === "oauth" && Boolean(params.credential.accessToken);
+}
+async function fetchKiroUsageReport(params, ctx) {
+  if (!supportsKiroUsage(params))
+    return null;
+  const credential = params.credential;
+  const raw = credential.accessToken?.trim();
+  if (!raw)
+    return null;
+  let access;
+  try {
+    access = parseAccessKey(raw);
+  } catch {
+    return null;
+  }
+  const region = (access.profileArn ? regionFromProfileArn(access.profileArn) : undefined) ?? access.region;
+  const snapshot = await fetchKiroUsage(ctx.fetch, access.token, region, access.profileArn, params.signal);
+  const usedFraction = snapshot.totalCredits > 0 ? snapshot.usedCredits / snapshot.totalCredits : undefined;
+  const remainingFraction = snapshot.totalCredits > 0 ? snapshot.remainingCredits / snapshot.totalCredits : undefined;
+  const limit = {
+    id: "credits",
+    label: "Credits",
+    scope: {
+      provider: KIRO_PROVIDER_ID,
+      ...snapshot.subscriptionTitle ? { tier: snapshot.subscriptionTitle } : {},
+      ...credential.accountId ? { accountId: credential.accountId } : {},
+      ...credential.projectId ? { projectId: credential.projectId } : {},
+      ...credential.orgId ? { orgId: credential.orgId } : {}
+    },
+    window: {
+      id: "monthly",
+      label: "Monthly",
+      ...snapshot.resetTimestampMs !== undefined ? { resetsAt: snapshot.resetTimestampMs } : {}
+    },
+    amount: {
+      used: snapshot.usedCredits,
+      limit: snapshot.totalCredits,
+      remaining: snapshot.remainingCredits,
+      ...usedFraction !== undefined ? { usedFraction } : {},
+      ...remainingFraction !== undefined ? { remainingFraction } : {},
+      unit: "credits"
+    },
+    status: usageStatusFor(usedFraction)
+  };
+  return {
+    provider: KIRO_PROVIDER_ID,
+    fetchedAt: Date.now(),
+    limits: [limit],
+    metadata: {
+      region,
+      ...credential.email ? { email: credential.email } : {},
+      ...snapshot.subscriptionTitle ? { subscriptionTitle: snapshot.subscriptionTitle } : {}
+    }
+  };
+}
+var kiroUsageProvider = {
+  id: KIRO_PROVIDER_ID,
+  supports: supportsKiroUsage,
+  validatesCredentials: true,
+  fetchUsage: fetchKiroUsageReport
+};
+
 // src/provider.ts
 function kiroProviderConfig(deps) {
   return {
+    usage: kiroUsageProvider,
     baseUrl: runtimeBaseUrl(KIRO_DEFAULT_REGION),
     api: KIRO_API_ID,
     authHeader: false,

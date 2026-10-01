@@ -18,6 +18,8 @@ describe("OMP packaging", () => {
     expect(typeof kiro?.config.fetchDynamicModels).toBe("function");
     expect(typeof kiro?.config.oauth?.login).toBe("function");
     expect(typeof kiro?.config.oauth?.refreshToken).toBe("function");
+    // Credit quota reaches `/usage` only through the registered usage provider.
+    expect(typeof kiro?.config.usage?.fetchUsage).toBe("function");
   });
 
   test("the marketplace catalog parses and points at the repository root", async () => {
