@@ -53,12 +53,19 @@ the newer Claude and GPT models with thinking controls.
 
 ## Check your credits
 
-Inside an `omp` session, run `/usage`. The Kiro section shows your plan, credits
-used out of your monthly allowance, credits remaining, and the reset date (plus
-bonus credits when your account has them).
+```sh
+omp usage                 # every signed-in account, including Kiro
+omp usage --provider kiro # only Kiro accounts
+```
 
-> The standalone `omp usage` command on OMP 18.2.x does not load plugins, so it
-> prints "no usage data" for Kiro. Use `/usage` inside a session instead.
+The same data appears in `/usage` inside an OMP session. Both show the plan,
+monthly credits used and remaining, the reset date, and bonus credits when your
+account has them.
+
+Standalone `omp usage` reports Kiro through the installed plugin, as verified on
+omp 18.4.8. If a signed-in Kiro account renders as `no usage data`, that build
+does not load plugins for the standalone command — use `/usage` inside a session
+instead.
 
 ## Troubleshooting
 
