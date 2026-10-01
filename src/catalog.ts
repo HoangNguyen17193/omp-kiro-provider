@@ -2,6 +2,7 @@ import type { Model } from "@oh-my-pi/pi-ai";
 import { z } from "zod";
 import {
   BUILDER_ID_PROFILE_ARN,
+  type KiroAccessEnvelope,
   KIRO_DEFAULT_REGION,
   managementBaseUrl,
   parseAccessKey,
@@ -92,6 +93,16 @@ export async function resolveProfile(
   throw new Error("No Kiro profile is available for this account", { cause: lastError });
 }
 
+/** The stored profile when the credential carries one, otherwise a discovered one. */
+export function profileFor(
+  fetchImpl: FetchLike,
+  access: KiroAccessEnvelope,
+  signal?: AbortSignal,
+): Promise<ProfileResolution> | ProfileResolution {
+  if (access.profileArn) return { arn: access.profileArn, region: regionFromProfileArn(access.profileArn) ?? access.region };
+  return resolveProfile(fetchImpl, access.token, access.region, { builderId: false, signal });
+}
+
 /** String enum at `path` inside a JSON Schema document, if present. */
 function enumAt(root: unknown, path: readonly string[]): string[] | undefined {
   let node = root;
@@ -165,9 +176,7 @@ export async function fetchKiroModels(
 ): Promise<KiroModelConfig[]> {
   if (!apiKey) throw new Error("Kiro is not signed in or its token has expired; model discovery deferred (run /login to sign in)");
   const access = parseAccessKey(apiKey);
-  const profile = access.profileArn
-    ? { arn: access.profileArn, region: regionFromProfileArn(access.profileArn) ?? access.region }
-    : await resolveProfile(fetchImpl, access.token, access.region, { builderId: false, signal });
+  const profile = await profileFor(fetchImpl, access, signal);
   const query = new URLSearchParams({ origin: "KIRO_CLI", profileArn: profile.arn });
   const { models } = await requestJson(
     fetchImpl,

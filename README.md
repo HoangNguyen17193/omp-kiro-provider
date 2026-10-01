@@ -17,12 +17,13 @@ omp plugin install omp-kiro-provider@omp-kiro-provider
 Restart `omp` after installing.
 
 > **Do not** load this alongside another Kiro provider plugin (for example
-> `omp-kiro`, `pi-provider-kiro`, or satanX's built-in Kiro transport). They all
-> register the same `kiro` provider id and will conflict.
+> `omp-kiro` or `pi-provider-kiro`). They all register the same `kiro` provider
+> id and will conflict.
 
 ## Log in
 
-Inside `omp`:
+Step-by-step walkthrough of each prompt, plus troubleshooting:
+[docs/login.md](docs/login.md). Short version, inside `omp`:
 
 1. Run `/login` and choose **Kiro (AWS Builder ID / IAM Identity Center)**.
 2. **Start URL**
@@ -50,6 +51,15 @@ The model list comes from Kiro and depends on your plan: a free Builder ID
 account sees a small set of older models, while paid plans (Pro, Pro Max) add
 the newer Claude and GPT models with thinking controls.
 
+## Check your credits
+
+Inside an `omp` session, run `/usage`. The Kiro section shows your plan, credits
+used out of your monthly allowance, credits remaining, and the reset date (plus
+bonus credits when your account has them).
+
+> The standalone `omp usage` command on OMP 18.2.x does not load plugins, so it
+> prints "no usage data" for Kiro. Use `/usage` inside a session instead.
+
 ## Troubleshooting
 
 - **Only old models show up.** You are probably signed in with a free Builder ID,
@@ -63,7 +73,6 @@ the newer Claude and GPT models with thinking controls.
 
 ## Not built yet
 
-- Credit-balance reporting in `/usage`
 - Reusing an existing `kiro-cli` login
 - Google / GitHub social login
 - Mapping tool names that Opus-class models sometimes invent

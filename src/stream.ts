@@ -11,8 +11,8 @@ import type {
   ToolCall,
 } from "@oh-my-pi/pi-ai";
 import { z } from "zod";
-import { resolveProfile } from "./catalog";
-import { parseAccessKey, regionFromProfileArn, runtimeBaseUrl } from "./endpoints";
+import { profileFor } from "./catalog";
+import { parseAccessKey, runtimeBaseUrl } from "./endpoints";
 import { EventStreamDecoder, type EventStreamMessage } from "./eventstream";
 import { type FetchLike, httpErrorFrom, KiroHttpError } from "./http";
 import { buildKiroRequest } from "./request";
@@ -23,7 +23,7 @@ import { buildKiroRequest } from "./request";
  * EventStream response into OMP assistant-message events.
  */
 
-const USER_AGENT = "omp-kiro-provider/0.1.0";
+const USER_AGENT = "omp-kiro-provider/0.2.0";
 const TRANSIENT_TOOL_FORMAT = /invalid tool use format\.*\s*$/i;
 const CONTEXT_OVERFLOW = /CONTENT_LENGTH_EXCEEDS_THRESHOLD|input is too long/i;
 /** First-event budget: the reference Kiro client allows up to 180s for Opus-class first tokens. */
@@ -353,9 +353,7 @@ async function run(
     const access = parseAccessKey(apiKey);
     const fetchImpl = options?.fetch ?? deps.fetch;
     watchdog.arm(firstEventMs, "the first event");
-    const profile = access.profileArn
-      ? { arn: access.profileArn, region: regionFromProfileArn(access.profileArn) ?? access.region }
-      : await raceAbort(resolveProfile(fetchImpl, access.token, access.region, { builderId: false, signal }), signal);
+    const profile = await raceAbort(Promise.resolve(profileFor(fetchImpl, access, signal)), signal);
     const body = buildKiroRequest(model, context, options, {
       toolSchema: deps.toolSchema,
       conversationId: options?.sessionId ?? deps.randomUUID(),

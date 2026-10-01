@@ -4,6 +4,7 @@ import { type KiroAuthDeps, loginKiro, refreshKiro } from "./auth";
 import { fetchKiroModels } from "./catalog";
 import { KIRO_API_ID, KIRO_DEFAULT_REGION, runtimeBaseUrl } from "./endpoints";
 import { type KiroStreamDeps, streamKiro } from "./stream";
+import { kiroUsageProvider } from "./usage";
 
 export { KIRO_PROVIDER_ID } from "./endpoints";
 
@@ -28,5 +29,6 @@ export function kiroProviderConfig(deps: KiroProviderDeps) {
       refreshToken: (credentials: OAuthCredentials, signal?: AbortSignal) => refreshKiro(deps, credentials, signal),
     },
     fetchDynamicModels: (apiKey: string | undefined) => fetchKiroModels(deps.fetch, apiKey),
+    usage: kiroUsageProvider(deps.now),
   };
 }

@@ -19578,6 +19578,11 @@ async function resolveProfile(fetchImpl, token, region, options) {
     return { arn: BUILDER_ID_PROFILE_ARN, region: KIRO_DEFAULT_REGION };
   throw new Error("No Kiro profile is available for this account", { cause: lastError });
 }
+function profileFor(fetchImpl, access, signal) {
+  if (access.profileArn)
+    return { arn: access.profileArn, region: regionFromProfileArn(access.profileArn) ?? access.region };
+  return resolveProfile(fetchImpl, access.token, access.region, { builderId: false, signal });
+}
 function enumAt(root, path) {
   let node2 = root;
   for (const key of path) {
@@ -19632,7 +19637,7 @@ async function fetchKiroModels(fetchImpl, apiKey, signal) {
   if (!apiKey)
     throw new Error("Kiro is not signed in or its token has expired; model discovery deferred (run /login to sign in)");
   const access = parseAccessKey(apiKey);
-  const profile = access.profileArn ? { arn: access.profileArn, region: regionFromProfileArn(access.profileArn) ?? access.region } : await resolveProfile(fetchImpl, access.token, access.region, { builderId: false, signal });
+  const profile = await profileFor(fetchImpl, access, signal);
   const query = new URLSearchParams({ origin: "KIRO_CLI", profileArn: profile.arn });
   const { models } = await requestJson(fetchImpl, {
     method: "GET",
@@ -20234,7 +20239,7 @@ function buildKiroRequest(model, context, options, deps) {
 }
 
 // src/stream.ts
-var USER_AGENT = "omp-kiro-provider/0.1.0";
+var USER_AGENT = "omp-kiro-provider/0.2.0";
 var TRANSIENT_TOOL_FORMAT = /invalid tool use format\.*\s*$/i;
 var CONTEXT_OVERFLOW = /CONTENT_LENGTH_EXCEEDS_THRESHOLD|input is too long/i;
 var FIRST_EVENT_TIMEOUT_MS = 180000;
@@ -20536,7 +20541,7 @@ async function run(deps, stream, output2, model, context, options) {
     const access = parseAccessKey(apiKey);
     const fetchImpl = options?.fetch ?? deps.fetch;
     watchdog.arm(firstEventMs, "the first event");
-    const profile = access.profileArn ? { arn: access.profileArn, region: regionFromProfileArn(access.profileArn) ?? access.region } : await raceAbort(resolveProfile(fetchImpl, access.token, access.region, { builderId: false, signal }), signal);
+    const profile = await raceAbort(Promise.resolve(profileFor(fetchImpl, access, signal)), signal);
     const body = buildKiroRequest(model, context, options, {
       toolSchema: deps.toolSchema,
       conversationId: options?.sessionId ?? deps.randomUUID(),
@@ -20621,6 +20626,148 @@ function streamKiro(deps, model, context, options) {
   return stream;
 }
 
+// src/usage.ts
+var WARNING_FRACTION = 0.9;
+var EpochSchema = exports_external.union([exports_external.number(), exports_external.string()]).nullish();
+var CountSchema = exports_external.number().nullish();
+var FreeTrialSchema = exports_external.looseObject({
+  freeTrialStatus: exports_external.string().nullish(),
+  freeTrialExpiry: EpochSchema,
+  currentUsage: CountSchema,
+  currentUsageWithPrecision: CountSchema,
+  usageLimit: CountSchema,
+  usageLimitWithPrecision: CountSchema
+});
+var BreakdownSchema = exports_external.looseObject({
+  resourceType: exports_external.string().nullish(),
+  displayName: exports_external.string().nullish(),
+  displayNamePlural: exports_external.string().nullish(),
+  currentUsage: CountSchema,
+  currentUsageWithPrecision: CountSchema,
+  usageLimit: CountSchema,
+  usageLimitWithPrecision: CountSchema,
+  currentOverages: CountSchema,
+  currentOveragesWithPrecision: CountSchema,
+  nextDateReset: EpochSchema,
+  freeTrialInfo: FreeTrialSchema.nullish()
+});
+var UsageLimitsSchema = exports_external.looseObject({
+  nextDateReset: EpochSchema,
+  usageBreakdownList: exports_external.array(BreakdownSchema).nullish(),
+  usageBreakdown: BreakdownSchema.nullish(),
+  subscriptionInfo: exports_external.looseObject({ subscriptionTitle: exports_external.string().nullish() }).nullish(),
+  overageConfiguration: exports_external.looseObject({ overageStatus: exports_external.string().nullish() }).nullish()
+});
+function toMillis(value) {
+  if (value === null || value === undefined)
+    return;
+  const ms = typeof value === "number" ? value * 1000 : Date.parse(value);
+  return Number.isFinite(ms) ? ms : undefined;
+}
+function statusFor(used, limit) {
+  if (used === undefined || !limit)
+    return "unknown";
+  if (used >= limit)
+    return "exhausted";
+  return used / limit >= WARNING_FRACTION ? "warning" : "ok";
+}
+function creditLimit(input2) {
+  const { used, limit } = input2;
+  const usage = {
+    id: input2.id,
+    label: input2.label,
+    scope: { provider: KIRO_PROVIDER_ID, ...input2.tier ? { tier: input2.tier } : {} },
+    amount: {
+      unit: "credits",
+      ...used !== undefined ? { used } : {},
+      ...limit !== undefined ? { limit } : {},
+      ...used !== undefined && limit ? { remaining: Math.max(0, limit - used), usedFraction: used / limit } : {}
+    },
+    status: statusFor(used, limit)
+  };
+  if (input2.resetsAt !== undefined) {
+    usage.window = { id: input2.id, label: input2.windowLabel, resetsAt: input2.resetsAt };
+  }
+  if (input2.notes.length > 0)
+    usage.notes = input2.notes;
+  return usage;
+}
+function limitsFor(bucket, index, tier, fallbackReset) {
+  const id = `kiro:${(bucket.resourceType ?? `usage-${index}`).toLowerCase()}`;
+  const overages = bucket.currentOveragesWithPrecision ?? bucket.currentOverages ?? 0;
+  const limits = [
+    creditLimit({
+      id,
+      label: bucket.displayNamePlural ?? bucket.displayName ?? "Credits",
+      used: bucket.currentUsageWithPrecision ?? bucket.currentUsage ?? undefined,
+      limit: bucket.usageLimitWithPrecision ?? bucket.usageLimit ?? undefined,
+      resetsAt: toMillis(bucket.nextDateReset) ?? fallbackReset,
+      windowLabel: "Monthly",
+      tier,
+      notes: overages > 0 ? [`Overage: ${overages}`] : []
+    })
+  ];
+  const trial = bucket.freeTrialInfo;
+  const trialLimit = trial?.usageLimitWithPrecision ?? trial?.usageLimit ?? undefined;
+  if (trial && trialLimit) {
+    limits.push(creditLimit({
+      id: `${id}:bonus`,
+      label: "Bonus credits",
+      used: trial.currentUsageWithPrecision ?? trial.currentUsage ?? undefined,
+      limit: trialLimit,
+      resetsAt: toMillis(trial.freeTrialExpiry),
+      windowLabel: "Bonus",
+      tier,
+      notes: trial.freeTrialStatus ? [`Status: ${trial.freeTrialStatus}`] : []
+    }));
+  }
+  return limits;
+}
+async function fetchKiroUsage(fetchImpl, apiKey, now, signal) {
+  const access = parseAccessKey(apiKey);
+  const profile = await profileFor(fetchImpl, access, signal);
+  const query = new URLSearchParams({
+    origin: "KIRO_CLI",
+    resourceType: "CREDIT",
+    isEmailRequired: "false",
+    profileArn: profile.arn
+  });
+  const raw = await requestJson(fetchImpl, {
+    method: "GET",
+    url: `${managementBaseUrl(profile.region)}/Get-Usage-Limits?${query}`,
+    headers: { Authorization: `Bearer ${access.token}` },
+    signal,
+    label: "Kiro usage"
+  }, UsageLimitsSchema);
+  const tier = raw.subscriptionInfo?.subscriptionTitle ?? undefined;
+  const buckets = raw.usageBreakdownList ?? (raw.usageBreakdown ? [raw.usageBreakdown] : []);
+  const fallbackReset = toMillis(raw.nextDateReset);
+  const report = {
+    provider: KIRO_PROVIDER_ID,
+    fetchedAt: now,
+    limits: buckets.flatMap((bucket, index) => limitsFor(bucket, index, tier, fallbackReset)),
+    metadata: {
+      ...tier ? { subscription: tier } : {},
+      ...raw.overageConfiguration?.overageStatus ? { overageStatus: raw.overageConfiguration.overageStatus } : {}
+    }
+  };
+  if (tier)
+    report.notes = [`Plan: ${tier}`];
+  return report;
+}
+function kiroUsageProvider(now) {
+  return {
+    id: KIRO_PROVIDER_ID,
+    validatesCredentials: true,
+    async fetchUsage(params, ctx) {
+      const key = params.credential.accessToken ?? params.credential.apiKey;
+      if (!key)
+        return null;
+      return fetchKiroUsage(ctx.fetch, key, now(), params.signal);
+    }
+  };
+}
+
 // src/provider.ts
 function kiroProviderConfig(deps) {
   return {
@@ -20633,7 +20780,8 @@ function kiroProviderConfig(deps) {
       login: (callbacks) => loginKiro({ ...deps, fetch: callbacks.fetch ?? deps.fetch }, callbacks),
       refreshToken: (credentials, signal) => refreshKiro(deps, credentials, signal)
     },
-    fetchDynamicModels: (apiKey) => fetchKiroModels(deps.fetch, apiKey)
+    fetchDynamicModels: (apiKey) => fetchKiroModels(deps.fetch, apiKey),
+    usage: kiroUsageProvider(deps.now)
   };
 }
 
