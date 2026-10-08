@@ -55,7 +55,8 @@ the newer Claude and GPT models with thinking controls.
 
 Inside an `omp` session, run `/usage`. The Kiro section shows your plan, credits
 used out of your monthly allowance, credits remaining, and the reset date (plus
-bonus credits when your account has them).
+bonus credits when your account has them). With several Kiro logins saved, each
+account is listed under its own email.
 
 > The standalone `omp usage` command on OMP 18.2.x does not load plugins, so it
 > prints "no usage data" for Kiro. Use `/usage` inside a session instead.
@@ -102,6 +103,11 @@ Tests never touch the network; they use fake transports.
 - **Models:** `List-Available-Models`, scoped to the profile. Discovery fails
   rather than returning an empty list when the token is missing or expired, so
   OMP keeps its cached catalog.
+- **Identity:** `Get-Usage-Limits` (with `isEmailRequired=true`) names the
+  signed-in user. The plugin stores the user id as the credential's `accountId`
+  and the email beside it, at login and on the first refresh of an older login,
+  so OMP tells accounts apart and replaces the row when the same user signs in
+  again. Usage reports carry the same `email`/`accountId`.
 - **Streaming:** `runtime.<profile region>.kiro.dev/generateAssistantResponse`,
   AWS EventStream frames with CRC checks, first-event (180 s) and idle (300 s)
   stall timeouts. History is normalized to Kiro's turn, pairing, and unique-id

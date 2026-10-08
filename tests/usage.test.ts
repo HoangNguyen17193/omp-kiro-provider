@@ -15,9 +15,10 @@ function fetchUsage(body: unknown) {
 }
 
 describe("Kiro usage", () => {
-  test("reports monthly credits and bonus credits from the profile's region", async () => {
+  test("reports monthly credits, bonus credits, and the signed-in user from the profile's region", async () => {
     const { report, calls } = fetchUsage({
       subscriptionInfo: { subscriptionTitle: "KIRO PRO MAX" },
+      userInfo: { email: "dev@example.com", userId: "d-1234567890.user-1" },
       nextDateReset: RESET_SECONDS,
       usageBreakdownList: [
         {
@@ -39,11 +40,13 @@ describe("Kiro usage", () => {
     expect(Object.fromEntries(url.searchParams)).toEqual({
       origin: "KIRO_CLI",
       resourceType: "CREDIT",
-      isEmailRequired: "false",
+      isEmailRequired: "true",
       profileArn: PROFILE_ARN,
     });
     expect(calls[0]?.headers.Authorization).toBe("Bearer test-access");
     expect(result?.notes).toEqual(["Plan: KIRO PRO MAX"]);
+    // Same-plan accounts look identical by usage alone; the user identity is what tells them apart.
+    expect(result?.metadata).toEqual({ email: "dev@example.com", accountId: "d-1234567890.user-1", subscription: "KIRO PRO MAX" });
     expect(result?.limits).toEqual([
       {
         id: "kiro:credit",
@@ -73,6 +76,9 @@ describe("Kiro usage", () => {
       statuses.push((await report)?.limits[0]?.status);
     }
     expect(statuses).toEqual(["ok", "warning", "exhausted", "exhausted"]);
+    // Without a userInfo block the report carries no identity rather than an empty one.
+    const { report } = fetchUsage({ userInfo: { email: " ", userId: null }, usageBreakdownList: [] });
+    expect((await report)?.metadata).toEqual({});
   });
 
   test("returns no report without a credential and surfaces HTTP errors", async () => {

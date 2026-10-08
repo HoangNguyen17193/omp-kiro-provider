@@ -19649,6 +19649,160 @@ async function fetchKiroModels(fetchImpl, apiKey, signal) {
   return models.map(toModelConfig);
 }
 
+// src/usage.ts
+var WARNING_FRACTION = 0.9;
+var EpochSchema = exports_external.union([exports_external.number(), exports_external.string()]).nullish();
+var CountSchema = exports_external.number().nullish();
+var FreeTrialSchema = exports_external.looseObject({
+  freeTrialStatus: exports_external.string().nullish(),
+  freeTrialExpiry: EpochSchema,
+  currentUsage: CountSchema,
+  currentUsageWithPrecision: CountSchema,
+  usageLimit: CountSchema,
+  usageLimitWithPrecision: CountSchema
+});
+var BreakdownSchema = exports_external.looseObject({
+  resourceType: exports_external.string().nullish(),
+  displayName: exports_external.string().nullish(),
+  displayNamePlural: exports_external.string().nullish(),
+  currentUsage: CountSchema,
+  currentUsageWithPrecision: CountSchema,
+  usageLimit: CountSchema,
+  usageLimitWithPrecision: CountSchema,
+  currentOverages: CountSchema,
+  currentOveragesWithPrecision: CountSchema,
+  nextDateReset: EpochSchema,
+  freeTrialInfo: FreeTrialSchema.nullish()
+});
+var UsageLimitsSchema = exports_external.looseObject({
+  nextDateReset: EpochSchema,
+  usageBreakdownList: exports_external.array(BreakdownSchema).nullish(),
+  usageBreakdown: BreakdownSchema.nullish(),
+  subscriptionInfo: exports_external.looseObject({ subscriptionTitle: exports_external.string().nullish() }).nullish(),
+  overageConfiguration: exports_external.looseObject({ overageStatus: exports_external.string().nullish() }).nullish(),
+  userInfo: exports_external.looseObject({ email: exports_external.string().nullish(), userId: exports_external.string().nullish() }).nullish()
+});
+function toMillis(value) {
+  if (value === null || value === undefined)
+    return;
+  const ms = typeof value === "number" ? value * 1000 : Date.parse(value);
+  return Number.isFinite(ms) ? ms : undefined;
+}
+function statusFor(used, limit) {
+  if (used === undefined || !limit)
+    return "unknown";
+  if (used >= limit)
+    return "exhausted";
+  return used / limit >= WARNING_FRACTION ? "warning" : "ok";
+}
+function creditLimit(input2) {
+  const { used, limit } = input2;
+  const usage = {
+    id: input2.id,
+    label: input2.label,
+    scope: { provider: KIRO_PROVIDER_ID, ...input2.tier ? { tier: input2.tier } : {} },
+    amount: {
+      unit: "credits",
+      ...used !== undefined ? { used } : {},
+      ...limit !== undefined ? { limit } : {},
+      ...used !== undefined && limit ? { remaining: Math.max(0, limit - used), usedFraction: used / limit } : {}
+    },
+    status: statusFor(used, limit)
+  };
+  if (input2.resetsAt !== undefined) {
+    usage.window = { id: input2.id, label: input2.windowLabel, resetsAt: input2.resetsAt };
+  }
+  if (input2.notes.length > 0)
+    usage.notes = input2.notes;
+  return usage;
+}
+function limitsFor(bucket, index, tier, fallbackReset) {
+  const id = `kiro:${(bucket.resourceType ?? `usage-${index}`).toLowerCase()}`;
+  const overages = bucket.currentOveragesWithPrecision ?? bucket.currentOverages ?? 0;
+  const limits = [
+    creditLimit({
+      id,
+      label: bucket.displayNamePlural ?? bucket.displayName ?? "Credits",
+      used: bucket.currentUsageWithPrecision ?? bucket.currentUsage ?? undefined,
+      limit: bucket.usageLimitWithPrecision ?? bucket.usageLimit ?? undefined,
+      resetsAt: toMillis(bucket.nextDateReset) ?? fallbackReset,
+      windowLabel: "Monthly",
+      tier,
+      notes: overages > 0 ? [`Overage: ${overages}`] : []
+    })
+  ];
+  const trial = bucket.freeTrialInfo;
+  const trialLimit = trial?.usageLimitWithPrecision ?? trial?.usageLimit ?? undefined;
+  if (trial && trialLimit) {
+    limits.push(creditLimit({
+      id: `${id}:bonus`,
+      label: "Bonus credits",
+      used: trial.currentUsageWithPrecision ?? trial.currentUsage ?? undefined,
+      limit: trialLimit,
+      resetsAt: toMillis(trial.freeTrialExpiry),
+      windowLabel: "Bonus",
+      tier,
+      notes: trial.freeTrialStatus ? [`Status: ${trial.freeTrialStatus}`] : []
+    }));
+  }
+  return limits;
+}
+async function requestUsageLimits(fetchImpl, access, signal) {
+  const profile = await profileFor(fetchImpl, access, signal);
+  const query = new URLSearchParams({
+    origin: "KIRO_CLI",
+    resourceType: "CREDIT",
+    isEmailRequired: "true",
+    profileArn: profile.arn
+  });
+  return requestJson(fetchImpl, {
+    method: "GET",
+    url: `${managementBaseUrl(profile.region)}/Get-Usage-Limits?${query}`,
+    headers: { Authorization: `Bearer ${access.token}` },
+    signal,
+    label: "Kiro usage"
+  }, UsageLimitsSchema);
+}
+function identityFrom(raw) {
+  const email3 = raw.userInfo?.email?.trim();
+  const accountId = raw.userInfo?.userId?.trim();
+  return { ...email3 ? { email: email3 } : {}, ...accountId ? { accountId } : {} };
+}
+async function fetchKiroIdentity(fetchImpl, access, signal) {
+  return identityFrom(await requestUsageLimits(fetchImpl, access, signal));
+}
+async function fetchKiroUsage(fetchImpl, apiKey, now, signal) {
+  const raw = await requestUsageLimits(fetchImpl, parseAccessKey(apiKey), signal);
+  const tier = raw.subscriptionInfo?.subscriptionTitle ?? undefined;
+  const buckets = raw.usageBreakdownList ?? (raw.usageBreakdown ? [raw.usageBreakdown] : []);
+  const fallbackReset = toMillis(raw.nextDateReset);
+  const report = {
+    provider: KIRO_PROVIDER_ID,
+    fetchedAt: now,
+    limits: buckets.flatMap((bucket, index) => limitsFor(bucket, index, tier, fallbackReset)),
+    metadata: {
+      ...identityFrom(raw),
+      ...tier ? { subscription: tier } : {},
+      ...raw.overageConfiguration?.overageStatus ? { overageStatus: raw.overageConfiguration.overageStatus } : {}
+    }
+  };
+  if (tier)
+    report.notes = [`Plan: ${tier}`];
+  return report;
+}
+function kiroUsageProvider(now) {
+  return {
+    id: KIRO_PROVIDER_ID,
+    validatesCredentials: true,
+    async fetchUsage(params, ctx) {
+      const key = params.credential.accessToken ?? params.credential.apiKey;
+      if (!key)
+        return null;
+      return fetchKiroUsage(ctx.fetch, key, now(), params.signal);
+    }
+  };
+}
+
 // src/auth.ts
 var SCOPES = [
   "codewhisperer:completions",
@@ -19661,6 +19815,7 @@ var CLIENT_NAME = "omp-kiro-provider";
 var DEVICE_GRANT = "urn:ietf:params:oauth:grant-type:device_code";
 var EXPIRY_MARGIN_MS = 5 * 60 * 1000;
 var REQUEST_TIMEOUT_MS = 15000;
+var REFRESH_IDENTITY_TIMEOUT_MS = 3000;
 var IDC_REGIONS = [
   "us-east-1",
   "eu-west-1",
@@ -19699,8 +19854,8 @@ var TokenSchema = exports_external.looseObject({
   refreshToken: exports_external.string().optional(),
   expiresIn: exports_external.number().positive().optional()
 });
-function timeoutSignal(signal) {
-  const timeout = AbortSignal.timeout(REQUEST_TIMEOUT_MS);
+function timeoutSignal(signal, timeoutMs = REQUEST_TIMEOUT_MS) {
+  const timeout = AbortSignal.timeout(timeoutMs);
   return signal ? AbortSignal.any([signal, timeout]) : timeout;
 }
 async function registerAndAuthorize(deps, region, startUrl, signal) {
@@ -19748,13 +19903,23 @@ async function pollForToken(deps, registered, signal) {
   }
   throw new Error("Kiro login timed out before the device code was approved");
 }
-function credentialsFrom(deps, token, refresh, access) {
+function credentialsFrom(deps, token, refresh, access, identity) {
   const envelope = { token: token.accessToken, ...access };
   return {
     access: JSON.stringify(envelope),
     refresh: JSON.stringify(refresh),
-    expires: deps.now() + (token.expiresIn ?? 3600) * 1000 - EXPIRY_MARGIN_MS
+    expires: deps.now() + (token.expiresIn ?? 3600) * 1000 - EXPIRY_MARGIN_MS,
+    ...identity
   };
+}
+async function lookUpIdentity(deps, access, signal, timeoutMs) {
+  try {
+    return await fetchKiroIdentity(deps.fetch, access, timeoutSignal(signal, timeoutMs));
+  } catch (error62) {
+    if (signal?.aborted)
+      throw error62;
+    return {};
+  }
 }
 async function loginKiro(deps, callbacks) {
   const signal = callbacks.signal;
@@ -19800,13 +19965,15 @@ async function loginKiro(deps, callbacks) {
     throw new Error("Kiro login returned no refresh token");
   const apiRegion = apiRegionFor(registered.region);
   const profile = await resolveProfile(deps.fetch, token.accessToken, apiRegion, { builderId, signal });
+  const access = { region: apiRegion, profileArn: profile.arn };
+  const identity = await lookUpIdentity(deps, { token: token.accessToken, ...access }, signal, REQUEST_TIMEOUT_MS);
   return credentialsFrom(deps, token, {
     refreshToken: token.refreshToken,
     clientId: registered.client.clientId,
     clientSecret: registered.client.clientSecret,
     oidcRegion: registered.region,
     startUrl
-  }, { region: apiRegion, profileArn: profile.arn });
+  }, access, identity);
 }
 async function refreshKiro(deps, credentials, signal) {
   const refresh = parseRefreshEnvelope(credentials.refresh);
@@ -19833,7 +20000,8 @@ async function refreshKiro(deps, credentials, signal) {
     throw error62;
   }
   const { token: _stale, ...access } = previous;
-  return credentialsFrom(deps, token, { ...refresh, refreshToken: token.refreshToken ?? refresh.refreshToken }, access);
+  const identity = credentials.accountId ? {} : await lookUpIdentity(deps, { token: token.accessToken, ...access }, signal, REFRESH_IDENTITY_TIMEOUT_MS);
+  return credentialsFrom(deps, token, { ...refresh, refreshToken: token.refreshToken ?? refresh.refreshToken }, access, identity);
 }
 
 // src/eventstream.ts
@@ -20624,148 +20792,6 @@ function streamKiro(deps, model, context, options) {
   };
   run(deps, stream, output2, model, context, options);
   return stream;
-}
-
-// src/usage.ts
-var WARNING_FRACTION = 0.9;
-var EpochSchema = exports_external.union([exports_external.number(), exports_external.string()]).nullish();
-var CountSchema = exports_external.number().nullish();
-var FreeTrialSchema = exports_external.looseObject({
-  freeTrialStatus: exports_external.string().nullish(),
-  freeTrialExpiry: EpochSchema,
-  currentUsage: CountSchema,
-  currentUsageWithPrecision: CountSchema,
-  usageLimit: CountSchema,
-  usageLimitWithPrecision: CountSchema
-});
-var BreakdownSchema = exports_external.looseObject({
-  resourceType: exports_external.string().nullish(),
-  displayName: exports_external.string().nullish(),
-  displayNamePlural: exports_external.string().nullish(),
-  currentUsage: CountSchema,
-  currentUsageWithPrecision: CountSchema,
-  usageLimit: CountSchema,
-  usageLimitWithPrecision: CountSchema,
-  currentOverages: CountSchema,
-  currentOveragesWithPrecision: CountSchema,
-  nextDateReset: EpochSchema,
-  freeTrialInfo: FreeTrialSchema.nullish()
-});
-var UsageLimitsSchema = exports_external.looseObject({
-  nextDateReset: EpochSchema,
-  usageBreakdownList: exports_external.array(BreakdownSchema).nullish(),
-  usageBreakdown: BreakdownSchema.nullish(),
-  subscriptionInfo: exports_external.looseObject({ subscriptionTitle: exports_external.string().nullish() }).nullish(),
-  overageConfiguration: exports_external.looseObject({ overageStatus: exports_external.string().nullish() }).nullish()
-});
-function toMillis(value) {
-  if (value === null || value === undefined)
-    return;
-  const ms = typeof value === "number" ? value * 1000 : Date.parse(value);
-  return Number.isFinite(ms) ? ms : undefined;
-}
-function statusFor(used, limit) {
-  if (used === undefined || !limit)
-    return "unknown";
-  if (used >= limit)
-    return "exhausted";
-  return used / limit >= WARNING_FRACTION ? "warning" : "ok";
-}
-function creditLimit(input2) {
-  const { used, limit } = input2;
-  const usage = {
-    id: input2.id,
-    label: input2.label,
-    scope: { provider: KIRO_PROVIDER_ID, ...input2.tier ? { tier: input2.tier } : {} },
-    amount: {
-      unit: "credits",
-      ...used !== undefined ? { used } : {},
-      ...limit !== undefined ? { limit } : {},
-      ...used !== undefined && limit ? { remaining: Math.max(0, limit - used), usedFraction: used / limit } : {}
-    },
-    status: statusFor(used, limit)
-  };
-  if (input2.resetsAt !== undefined) {
-    usage.window = { id: input2.id, label: input2.windowLabel, resetsAt: input2.resetsAt };
-  }
-  if (input2.notes.length > 0)
-    usage.notes = input2.notes;
-  return usage;
-}
-function limitsFor(bucket, index, tier, fallbackReset) {
-  const id = `kiro:${(bucket.resourceType ?? `usage-${index}`).toLowerCase()}`;
-  const overages = bucket.currentOveragesWithPrecision ?? bucket.currentOverages ?? 0;
-  const limits = [
-    creditLimit({
-      id,
-      label: bucket.displayNamePlural ?? bucket.displayName ?? "Credits",
-      used: bucket.currentUsageWithPrecision ?? bucket.currentUsage ?? undefined,
-      limit: bucket.usageLimitWithPrecision ?? bucket.usageLimit ?? undefined,
-      resetsAt: toMillis(bucket.nextDateReset) ?? fallbackReset,
-      windowLabel: "Monthly",
-      tier,
-      notes: overages > 0 ? [`Overage: ${overages}`] : []
-    })
-  ];
-  const trial = bucket.freeTrialInfo;
-  const trialLimit = trial?.usageLimitWithPrecision ?? trial?.usageLimit ?? undefined;
-  if (trial && trialLimit) {
-    limits.push(creditLimit({
-      id: `${id}:bonus`,
-      label: "Bonus credits",
-      used: trial.currentUsageWithPrecision ?? trial.currentUsage ?? undefined,
-      limit: trialLimit,
-      resetsAt: toMillis(trial.freeTrialExpiry),
-      windowLabel: "Bonus",
-      tier,
-      notes: trial.freeTrialStatus ? [`Status: ${trial.freeTrialStatus}`] : []
-    }));
-  }
-  return limits;
-}
-async function fetchKiroUsage(fetchImpl, apiKey, now, signal) {
-  const access = parseAccessKey(apiKey);
-  const profile = await profileFor(fetchImpl, access, signal);
-  const query = new URLSearchParams({
-    origin: "KIRO_CLI",
-    resourceType: "CREDIT",
-    isEmailRequired: "false",
-    profileArn: profile.arn
-  });
-  const raw = await requestJson(fetchImpl, {
-    method: "GET",
-    url: `${managementBaseUrl(profile.region)}/Get-Usage-Limits?${query}`,
-    headers: { Authorization: `Bearer ${access.token}` },
-    signal,
-    label: "Kiro usage"
-  }, UsageLimitsSchema);
-  const tier = raw.subscriptionInfo?.subscriptionTitle ?? undefined;
-  const buckets = raw.usageBreakdownList ?? (raw.usageBreakdown ? [raw.usageBreakdown] : []);
-  const fallbackReset = toMillis(raw.nextDateReset);
-  const report = {
-    provider: KIRO_PROVIDER_ID,
-    fetchedAt: now,
-    limits: buckets.flatMap((bucket, index) => limitsFor(bucket, index, tier, fallbackReset)),
-    metadata: {
-      ...tier ? { subscription: tier } : {},
-      ...raw.overageConfiguration?.overageStatus ? { overageStatus: raw.overageConfiguration.overageStatus } : {}
-    }
-  };
-  if (tier)
-    report.notes = [`Plan: ${tier}`];
-  return report;
-}
-function kiroUsageProvider(now) {
-  return {
-    id: KIRO_PROVIDER_ID,
-    validatesCredentials: true,
-    async fetchUsage(params, ctx) {
-      const key = params.credential.accessToken ?? params.credential.apiKey;
-      if (!key)
-        return null;
-      return fetchKiroUsage(ctx.fetch, key, now(), params.signal);
-    }
-  };
 }
 
 // src/provider.ts

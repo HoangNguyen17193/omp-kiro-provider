@@ -1,14 +1,15 @@
 import type { UsageFetchContext, UsageFetchParams, UsageLimit, UsageProvider, UsageReport, UsageStatus } from "@oh-my-pi/pi-ai";
 import { z } from "zod";
 import { profileFor } from "./catalog";
-import { KIRO_PROVIDER_ID, managementBaseUrl, parseAccessKey } from "./endpoints";
+import { type KiroAccessEnvelope, KIRO_PROVIDER_ID, managementBaseUrl, parseAccessKey } from "./endpoints";
 import { type FetchLike, requestJson } from "./http";
 
 /**
  * Account credit usage for `omp usage` and `/usage`, from Kiro's
  * `Get-Usage-Limits` management endpoint. OMP refreshes an expiring OAuth
  * credential before calling `fetchUsage`, so the stored access envelope is
- * used as-is.
+ * used as-is. The same response names the signed-in user, which is the only
+ * identity Kiro exposes: the token is opaque and carries no claims.
  */
 
 const WARNING_FRACTION = 0.9;
@@ -46,7 +47,9 @@ const UsageLimitsSchema = z.looseObject({
   usageBreakdown: BreakdownSchema.nullish(),
   subscriptionInfo: z.looseObject({ subscriptionTitle: z.string().nullish() }).nullish(),
   overageConfiguration: z.looseObject({ overageStatus: z.string().nullish() }).nullish(),
+  userInfo: z.looseObject({ email: z.string().nullish(), userId: z.string().nullish() }).nullish(),
 });
+type UsageLimits = z.infer<typeof UsageLimitsSchema>;
 type Breakdown = z.infer<typeof BreakdownSchema>;
 
 function toMillis(value: z.infer<typeof EpochSchema>): number | undefined {
@@ -125,21 +128,25 @@ function limitsFor(bucket: Breakdown, index: number, tier: string | undefined, f
   return limits;
 }
 
-export async function fetchKiroUsage(
-  fetchImpl: FetchLike,
-  apiKey: string,
-  now: number,
-  signal?: AbortSignal,
-): Promise<UsageReport> {
-  const access = parseAccessKey(apiKey);
+/**
+ * The signed-in user: the Builder ID or IAM Identity Center user id (stable,
+ * unique per user) and email. OMP keys a stored credential by `accountId`, so
+ * signing the same user in again replaces its row instead of adding one.
+ */
+export interface KiroIdentity {
+  email?: string;
+  accountId?: string;
+}
+
+async function requestUsageLimits(fetchImpl: FetchLike, access: KiroAccessEnvelope, signal: AbortSignal | undefined): Promise<UsageLimits> {
   const profile = await profileFor(fetchImpl, access, signal);
   const query = new URLSearchParams({
     origin: "KIRO_CLI",
     resourceType: "CREDIT",
-    isEmailRequired: "false",
+    isEmailRequired: "true",
     profileArn: profile.arn,
   });
-  const raw = await requestJson(
+  return requestJson(
     fetchImpl,
     {
       method: "GET",
@@ -150,6 +157,26 @@ export async function fetchKiroUsage(
     },
     UsageLimitsSchema,
   );
+}
+
+function identityFrom(raw: UsageLimits): KiroIdentity {
+  const email = raw.userInfo?.email?.trim();
+  const accountId = raw.userInfo?.userId?.trim();
+  return { ...(email ? { email } : {}), ...(accountId ? { accountId } : {}) };
+}
+
+/** The user Kiro reports for `access`; empty when Kiro names none. */
+export async function fetchKiroIdentity(fetchImpl: FetchLike, access: KiroAccessEnvelope, signal?: AbortSignal): Promise<KiroIdentity> {
+  return identityFrom(await requestUsageLimits(fetchImpl, access, signal));
+}
+
+export async function fetchKiroUsage(
+  fetchImpl: FetchLike,
+  apiKey: string,
+  now: number,
+  signal?: AbortSignal,
+): Promise<UsageReport> {
+  const raw = await requestUsageLimits(fetchImpl, parseAccessKey(apiKey), signal);
   const tier = raw.subscriptionInfo?.subscriptionTitle ?? undefined;
   const buckets = raw.usageBreakdownList ?? (raw.usageBreakdown ? [raw.usageBreakdown] : []);
   const fallbackReset = toMillis(raw.nextDateReset);
@@ -158,6 +185,8 @@ export async function fetchKiroUsage(
     fetchedAt: now,
     limits: buckets.flatMap((bucket, index) => limitsFor(bucket, index, tier, fallbackReset)),
     metadata: {
+      // OMP's usage identity (email, accountId) tells same-plan accounts apart.
+      ...identityFrom(raw),
       ...(tier ? { subscription: tier } : {}),
       ...(raw.overageConfiguration?.overageStatus ? { overageStatus: raw.overageConfiguration.overageStatus } : {}),
     },

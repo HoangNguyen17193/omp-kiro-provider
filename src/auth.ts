@@ -13,6 +13,7 @@ import {
   RegionSchema,
 } from "./endpoints";
 import { type FetchLike, KiroHttpError, requestJson } from "./http";
+import { fetchKiroIdentity, type KiroIdentity } from "./usage";
 
 /**
  * AWS SSO-OIDC device-code login (RFC 8628) for AWS Builder ID and IAM
@@ -32,6 +33,8 @@ const DEVICE_GRANT = "urn:ietf:params:oauth:grant-type:device_code";
 /** Refresh five minutes before the reported expiry so no request races it. */
 const EXPIRY_MARGIN_MS = 5 * 60 * 1000;
 const REQUEST_TIMEOUT_MS = 15_000;
+/** OMP gives a whole refresh 10 s; the identity lookup after the token request must fit well inside it. */
+const REFRESH_IDENTITY_TIMEOUT_MS = 3_000;
 /** Regions probed when an Identity Center user does not name one. */
 const IDC_REGIONS = [
   "us-east-1", "eu-west-1", "eu-central-1", "us-east-2", "eu-west-2", "eu-west-3",
@@ -71,8 +74,8 @@ export interface KiroAuthDeps {
   sleep(ms: number, signal?: AbortSignal): Promise<void>;
 }
 
-function timeoutSignal(signal: AbortSignal | undefined): AbortSignal {
-  const timeout = AbortSignal.timeout(REQUEST_TIMEOUT_MS);
+function timeoutSignal(signal: AbortSignal | undefined, timeoutMs = REQUEST_TIMEOUT_MS): AbortSignal {
+  const timeout = AbortSignal.timeout(timeoutMs);
   return signal ? AbortSignal.any([signal, timeout]) : timeout;
 }
 
@@ -154,13 +157,34 @@ function credentialsFrom(
   token: z.infer<typeof TokenSchema>,
   refresh: KiroRefreshEnvelope,
   access: Omit<KiroAccessEnvelope, "token">,
+  identity: KiroIdentity,
 ): OAuthCredentials {
   const envelope: KiroAccessEnvelope = { token: token.accessToken, ...access };
   return {
     access: JSON.stringify(envelope),
     refresh: JSON.stringify(refresh),
     expires: deps.now() + (token.expiresIn ?? 3600) * 1000 - EXPIRY_MARGIN_MS,
+    ...identity,
   };
+}
+
+/**
+ * The signed-in user, recorded on the credential so OMP can tell accounts
+ * apart and replace a re-signed-in user's row. Best effort: a login or refresh
+ * never fails because Kiro withheld the identity.
+ */
+async function lookUpIdentity(
+  deps: KiroAuthDeps,
+  access: KiroAccessEnvelope,
+  signal: AbortSignal | undefined,
+  timeoutMs: number,
+): Promise<KiroIdentity> {
+  try {
+    return await fetchKiroIdentity(deps.fetch, access, timeoutSignal(signal, timeoutMs));
+  } catch (error) {
+    if (signal?.aborted) throw error;
+    return {};
+  }
 }
 
 export async function loginKiro(deps: KiroAuthDeps, callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
@@ -210,6 +234,8 @@ export async function loginKiro(deps: KiroAuthDeps, callbacks: OAuthLoginCallbac
 
   const apiRegion = apiRegionFor(registered.region);
   const profile = await resolveProfile(deps.fetch, token.accessToken, apiRegion, { builderId, signal });
+  const access = { region: apiRegion, profileArn: profile.arn };
+  const identity = await lookUpIdentity(deps, { token: token.accessToken, ...access }, signal, REQUEST_TIMEOUT_MS);
   return credentialsFrom(
     deps,
     token,
@@ -220,7 +246,8 @@ export async function loginKiro(deps: KiroAuthDeps, callbacks: OAuthLoginCallbac
       oidcRegion: registered.region,
       startUrl,
     },
-    { region: apiRegion, profileArn: profile.arn },
+    access,
+    identity,
   );
 }
 
@@ -258,5 +285,9 @@ export async function refreshKiro(
     throw error;
   }
   const { token: _stale, ...access } = previous;
-  return credentialsFrom(deps, token, { ...refresh, refreshToken: token.refreshToken ?? refresh.refreshToken }, access);
+  // OMP keeps a stored identity across refreshes; look it up only for credentials signed in without one.
+  const identity = credentials.accountId
+    ? {}
+    : await lookUpIdentity(deps, { token: token.accessToken, ...access }, signal, REFRESH_IDENTITY_TIMEOUT_MS);
+  return credentialsFrom(deps, token, { ...refresh, refreshToken: token.refreshToken ?? refresh.refreshToken }, access, identity);
 }

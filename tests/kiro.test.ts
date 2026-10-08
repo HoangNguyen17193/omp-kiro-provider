@@ -325,6 +325,7 @@ describe("Kiro login and refresh", () => {
       }
       if (call.url.endsWith("/token")) return tokenReplies.shift()!;
       if (call.url.endsWith("/List-Available-Profiles")) return json(403, { message: "denied" });
+      if (call.url.includes("/Get-Usage-Limits?")) return json(200, { userInfo: { email: "dev@example.com", userId: "user-1" } });
       throw new Error(`unexpected ${call.url}`);
     });
     const sleeps: number[] = [];
@@ -341,7 +342,28 @@ describe("Kiro login and refresh", () => {
     expect(sleeps).toEqual([5000, 5000, 10000]);
     expect(JSON.parse(credentials.access)).toEqual({ token: "access-1", region: "us-east-1", profileArn: BUILDER_ID_PROFILE_ARN });
     expect(JSON.parse(credentials.refresh)).toMatchObject({ refreshToken: "refresh-1", clientId: "client-1", oidcRegion: "us-east-1" });
+    // The user identity lets OMP replace this user's row on a later sign-in instead of adding a duplicate.
+    expect(new URL(calls.at(-1)!.url).searchParams.get("isEmailRequired")).toBe("true");
+    expect(calls.at(-1)?.headers.Authorization).toBe("Bearer access-1");
+    expect({ email: credentials.email, accountId: credentials.accountId }).toEqual({ email: "dev@example.com", accountId: "user-1" });
     expect(credentials.expires).toBe(20_000 + 3600_000 - 300_000);
+  });
+
+  test("a login cancelled during the identity lookup fails instead of saving the credential", async () => {
+    const controller = new AbortController();
+    const { fetch } = fakeFetch(call => {
+      if (call.url.endsWith("/client/register")) return json(200, { clientId: "client-1", clientSecret: "secret-1" });
+      if (call.url.endsWith("/device_authorization")) return json(200, { deviceCode: "dev-1", userCode: "ABCD-EFGH", verificationUri: "https://device.sso/" });
+      if (call.url.endsWith("/token")) return json(200, { accessToken: "access-1", refreshToken: "refresh-1" });
+      if (call.url.endsWith("/List-Available-Profiles")) return json(200, { profiles: [{ arn: PROFILE_ARN }] });
+      controller.abort();
+      return json(500, { message: "aborted" });
+    });
+    const login = loginKiro(
+      { fetch, now: () => 0, sleep: async () => {} },
+      { onPrompt: async () => "", onAuth: () => {}, signal: controller.signal },
+    );
+    await expect(login).rejects.toThrow();
   });
 
   test("refreshes against the registered OIDC region and keeps the profile", async () => {
@@ -364,6 +386,33 @@ describe("Kiro login and refresh", () => {
     await expect(
       refreshKiro({ fetch, now: () => 0, sleep: async () => {} }, { access: "{}", refresh: "not json", expires: 0 }),
     ).rejects.toThrow("run /login");
+  });
+
+  test("backfills a missing user identity on refresh, best effort", async () => {
+    const credentials = {
+      access: JSON.stringify({ token: "access-1", region: "eu-central-1", profileArn: PROFILE_ARN }),
+      refresh: JSON.stringify({ refreshToken: "refresh-1", clientId: "c", clientSecret: "s", oidcRegion: "eu-west-1", startUrl: "https://org.awsapps.com/start" }),
+      expires: 0,
+    };
+    const deps = (fetch: FetchLike) => ({ fetch, now: () => 0, sleep: async () => {} });
+    const token = () => json(200, { accessToken: "access-2", expiresIn: 1800 });
+
+    const lookup = fakeFetch(call => (call.url.endsWith("/token") ? token() : json(200, { userInfo: { email: "dev@example.com", userId: "user-1" } })));
+    const backfilled = await refreshKiro(deps(lookup.fetch), credentials);
+    expect(lookup.calls[1]?.headers.Authorization).toBe("Bearer access-2");
+    expect({ email: backfilled.email, accountId: backfilled.accountId }).toEqual({ email: "dev@example.com", accountId: "user-1" });
+
+    // A credential that already has its identity costs no extra request.
+    const known = fakeFetch(token);
+    const kept = await refreshKiro(deps(known.fetch), { ...credentials, accountId: "user-1" });
+    expect(known.calls).toHaveLength(1);
+    expect(kept.accountId).toBeUndefined();
+
+    // An identity lookup failure never fails the refresh.
+    const failing = fakeFetch(call => (call.url.endsWith("/token") ? token() : json(500, { message: "down" })));
+    const refreshed = await refreshKiro(deps(failing.fetch), credentials);
+    expect(JSON.parse(refreshed.access).token).toBe("access-2");
+    expect(refreshed.accountId).toBeUndefined();
   });
 
   test("reports every dead-grant refresh failure in a form OMP classifies as final", async () => {
