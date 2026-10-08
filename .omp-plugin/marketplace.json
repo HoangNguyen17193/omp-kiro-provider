@@ -4,13 +4,13 @@
   "owner": { "name": "tino" },
   "metadata": {
     "description": "Kiro model provider for Oh My Pi",
-    "version": "0.2.0"
+    "version": "0.3.0"
   },
   "plugins": [
     {
       "name": "omp-kiro-provider",
-      "description": "Kiro device-code login, account-scoped model discovery, credit usage, and streaming for OMP.",
-      "version": "0.2.0",
+      "description": "Kiro device-code login, account-scoped model discovery, credit usage with per-account identity, and streaming for OMP.",
+      "version": "0.3.0",
       "source": "./",
       "license": "MIT",
       "homepage": "https://github.com/HoangNguyen17193/omp-kiro-provider",

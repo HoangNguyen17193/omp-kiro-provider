@@ -1,6 +1,6 @@
 {
   "name": "omp-kiro-provider",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Kiro (AWS Builder ID / IAM Identity Center) model provider for Oh My Pi.",
   "type": "module",
   "license": "MIT",
